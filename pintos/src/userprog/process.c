@@ -21,39 +21,45 @@
 
 static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
-static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool load (char *cmdline, void (**eip) (void), void **esp);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
 tid_t
-process_execute (const char *file_name)
+process_execute (const char *cmd_line)
 {
-  char *fn_copy;
+  char *cmd_copy;
   tid_t tid;
 
   sema_init (&temporary, 0);
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
-  fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL)
+  cmd_copy = palloc_get_page (0);
+  if (cmd_copy == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
+  strlcpy (cmd_copy, cmd_line, PGSIZE);
+
+  // Extract first argument - our executable file
+  size_t len;
+  for (len = 0; cmd_line[len] != ' ' && cmd_line[len] != '\0'; len++);
+  char file_name[len + 1];
+  strlcpy(file_name, cmd_line, len + 1);
 
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (file_name, PRI_DEFAULT, start_process, cmd_copy);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy);
+    palloc_free_page (cmd_copy);
   return tid;
 }
 
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *file_name_)
+start_process (void *cmd_line_)
 {
-  char *file_name = file_name_;
+  char *cmd_line = cmd_line_;
   struct intr_frame if_;
   bool success;
 
@@ -62,10 +68,10 @@ start_process (void *file_name_)
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (cmd_line, &if_.eip, &if_.esp);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
+  palloc_free_page (cmd_line_);
   if (!success)
     thread_exit ();
 
@@ -200,7 +206,7 @@ struct Elf32_Phdr
 #define PF_W 2          /* Writable. */
 #define PF_R 4          /* Readable. */
 
-static bool setup_stack (void **esp);
+static bool setup_stack (char *cmd_line, void **esp);
 static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
@@ -211,7 +217,7 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
    and its initial stack pointer into *ESP.
    Returns true if successful, false otherwise. */
 bool
-load (const char *file_name, void (**eip) (void), void **esp)
+load (char *cmd_line, void (**eip) (void), void **esp)
 {
   struct thread *t = thread_current ();
   struct Elf32_Ehdr ehdr;
@@ -219,6 +225,12 @@ load (const char *file_name, void (**eip) (void), void **esp)
   off_t file_ofs;
   bool success = false;
   int i;
+
+  // Extract first argument - our executable file
+  size_t len;
+  for (len = 0; cmd_line[len] != ' ' && cmd_line[len] != '\0'; len++);
+  char file_name[len + 1];
+  strlcpy(file_name, cmd_line, len + 1);
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
@@ -307,7 +319,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
     }
 
   /* Set up stack. */
-  if (!setup_stack (esp))
+  if (!setup_stack (cmd_line, esp))
     goto done;
 
   /* Start address. */
@@ -432,7 +444,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
 static bool
-setup_stack (void **esp)
+setup_stack (char *cmd_line, void **esp)
 {
   uint8_t *kpage;
   bool success = false;
@@ -441,10 +453,57 @@ setup_stack (void **esp)
   if (kpage != NULL)
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
-      if (success)
-        *esp = PHYS_BASE;
-      else
-        palloc_free_page (kpage);
+      if (success) {
+
+        // We know we'll have at least one command line argument
+        // Put its contents at top of stack
+        int argc = 1;
+        char *arg_start = (char *) PHYS_BASE;
+        char *save;
+        // Note that strtok_r will modify contents of cmd_line
+        char *next_token = strtok_r(cmd_line, " ", &save);
+        arg_start -= (strlen(next_token) + 1);
+        strlcpy(arg_start, next_token, strlen(next_token) + 1);
+
+        // Copy any remaining arguments' contents to top of stack
+        while ((next_token = strtok_r(NULL, " ", &save)) != NULL) {
+            argc++;
+            arg_start -= (strlen(next_token) + 1);
+            strlcpy(arg_start, next_token, strlen(next_token) + 1);
+        }
+
+        // Compute necessary stack alignment padding
+        size_t bytes_written = (uint32_t)PHYS_BASE - (uint32_t)arg_start;
+        // Need additional bytes for argc, argv, and argv contents (including NULL sentinel)
+        size_t addtl_bytes_required = sizeof(int) + sizeof(char**) + sizeof(char*) * (argc + 1);
+        size_t padding = 16 - ((bytes_written + addtl_bytes_required) % 16);
+
+        // Load in sentinel argv entry
+        char **next_argv = (char **) (arg_start - padding - sizeof(char *));
+        *next_argv = NULL;
+        // Now, fill in argv entries backwards
+        // Tracing back up through stack to find start of each arg
+        for (int i = 0; i < argc; i++) {
+            next_argv--;
+            *next_argv = arg_start;
+            while (*arg_start != '\0') {
+                arg_start++;
+            }
+            arg_start++; // Step over last null byte
+        }
+
+        // Load up argv and argc
+        char ***argv_ptr = (char ***)((char *)next_argv - sizeof(char**));
+        *argv_ptr = (char **)next_argv;
+        int *argc_ptr = (int *)((char *)argv_ptr - sizeof(int));
+        *argc_ptr = argc;
+
+        // Finally, load up esp
+        *esp = (void *) ((uint32_t)argc_ptr - 4); // Subtract extra bytes for fake ret addr
+      }
+      else {
+          palloc_free_page (kpage);
+      }
     }
   return success;
 }

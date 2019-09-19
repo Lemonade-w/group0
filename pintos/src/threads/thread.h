@@ -26,6 +26,22 @@ typedef int tid_t;
 #define PRI_DEFAULT 31                  /* Default priority. */
 #define PRI_MAX 63                      /* Highest priority. */
 
+#define MAX_FDS 128
+#define RESERVED_FILE 0xFFFFFFFF
+
+struct wait_status {
+    tid_t tid;
+    tid_t parent;
+    int exit_code;
+    unsigned ref_count;
+    struct lock mutex;
+    struct semaphore terminated;
+    struct list_elem elem;
+};
+
+struct list wait_list;
+struct lock wait_list_mutex;
+
 /* A kernel thread or user process.
 
    Each thread structure is stored in its own 4 kB page.  The
@@ -95,6 +111,11 @@ struct thread
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
 
+    struct file *exec_file;
+    struct wait_status *wait_status;
+    struct file *open_files[MAX_FDS];
+    int next_file_slot;
+
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
@@ -125,7 +146,7 @@ struct thread *thread_current (void);
 tid_t thread_tid (void);
 const char *thread_name (void);
 
-void thread_exit (void) NO_RETURN;
+void thread_exit (int) NO_RETURN;
 void thread_yield (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */

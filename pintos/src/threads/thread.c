@@ -93,6 +93,9 @@ thread_init (void)
   list_init (&ready_list);
   list_init (&all_list);
 
+  list_init(&wait_list);
+  lock_init(&wait_list_mutex);
+
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
   init_thread (initial_thread, "main", PRI_DEFAULT);
@@ -198,6 +201,13 @@ thread_create (const char *name, int priority,
   sf->eip = switch_entry;
   sf->ebp = 0;
 
+  // File descriptors
+  t->next_file_slot = 0;
+  memset(&t->open_files, 0, sizeof(t->open_files));
+  // We never give out fds for STDIN and STDOUT
+  t->open_files[0] = RESERVED_FILE;
+  t->open_files[1] = RESERVED_FILE;
+
   /* Add to run queue. */
   thread_unblock (t);
 
@@ -278,12 +288,13 @@ thread_tid (void)
 /* Deschedules the current thread and destroys it.  Never
    returns to the caller. */
 void
-thread_exit (void)
+thread_exit (int status)
 {
   ASSERT (!intr_context ());
 
 #ifdef USERPROG
-  process_exit ();
+  process_exit (status);
+  printf("%s: exit(%d)\n", thread_current()->name, status);
 #endif
 
   /* Remove thread from all threads list, set our status to dying,
@@ -422,7 +433,7 @@ kernel_thread (thread_func *function, void *aux)
 
   intr_enable ();       /* The scheduler runs with interrupts off. */
   function (aux);       /* Execute the thread function. */
-  thread_exit ();       /* If function() returns, kill the thread. */
+  thread_exit (0);       /* If function() returns, kill the thread. */
 }
 
 /* Returns the running thread. */

@@ -1,6 +1,7 @@
 #include "userprog/process.h"
 #include <debug.h>
 #include <inttypes.h>
+#include <list.h>
 #include <round.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,14 +15,22 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
-static struct semaphore temporary;
+struct new_proc {
+    char *cmd_line;
+    char *file_name;
+    struct semaphore *sema;
+    struct wait_status *wait_status;
+    bool success;
+};
+
 static thread_func start_process NO_RETURN;
-static bool load (char *cmdline, void (**eip) (void), void **esp);
+static bool load (char *file_name, char *cmdline, void (**eip) (void), void **esp);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -33,8 +42,7 @@ process_execute (const char *cmd_line)
   char *cmd_copy;
   tid_t tid;
 
-  sema_init (&temporary, 0);
-  /* Make a copy of FILE_NAME.
+  /* Make a copy of cmd_line
      Otherwise there's a race between the caller and load(). */
   cmd_copy = palloc_get_page (0);
   if (cmd_copy == NULL)
@@ -47,33 +55,58 @@ process_execute (const char *cmd_line)
   char file_name[len + 1];
   strlcpy(file_name, cmd_line, len + 1);
 
+  struct semaphore exec_sem;
+  sema_init(&exec_sem, 0);
+
+  struct wait_status *wait_status = malloc(sizeof(struct wait_status));
+  wait_status->ref_count = 2;
+  lock_init(&wait_status->mutex);
+  sema_init(&wait_status->terminated, 0);
+  struct new_proc new_proc = { cmd_copy, file_name, &exec_sem, wait_status, false };
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, cmd_copy);
-  if (tid == TID_ERROR)
+  tid = thread_create (file_name, PRI_DEFAULT, start_process, &new_proc);
+  if (tid == TID_ERROR) {
     palloc_free_page (cmd_copy);
-  return tid;
+    free(wait_status);
+    return TID_ERROR;
+  }
+
+  sema_down(&exec_sem);
+  if (new_proc.success) {
+      wait_status->tid = tid;
+      wait_status->parent = thread_current()->tid;
+      lock_acquire(&wait_list_mutex);
+      list_push_front(&wait_list, &wait_status->elem);
+      lock_release(&wait_list_mutex);
+      return tid;
+  } else {
+      free(wait_status);
+      return TID_ERROR;
+  }
 }
 
 /* A thread function that loads a user process and starts it
    running. */
 static void
-start_process (void *cmd_line_)
+start_process (void *new_proc_arg)
 {
-  char *cmd_line = cmd_line_;
+  struct new_proc *new_proc = (struct new_proc *)new_proc_arg;
   struct intr_frame if_;
-  bool success;
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (cmd_line, &if_.eip, &if_.esp);
+  new_proc->success = load (new_proc->file_name, new_proc->cmd_line, &if_.eip, &if_.esp);
 
+  palloc_free_page (new_proc->cmd_line);
+  thread_current()->wait_status = new_proc->wait_status;
+  sema_up(new_proc->sema);
   /* If load failed, quit. */
-  palloc_free_page (cmd_line_);
-  if (!success)
-    thread_exit ();
+  if (!new_proc->success)
+    thread_exit (-1);
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -95,17 +128,96 @@ start_process (void *cmd_line_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED)
+process_wait (tid_t child_tid)
 {
-  sema_down (&temporary);
-  return 0;
+  struct wait_status *child_status = NULL;
+  lock_acquire(&wait_list_mutex);
+  struct list_elem *current;
+  for (current = list_begin(&wait_list); current != list_end(&wait_list); current = list_next(current)) {
+      struct wait_status *wait_status = list_entry(current, struct wait_status, elem);
+      if (wait_status->tid == child_tid && wait_status->parent == thread_current()->tid) {
+          child_status = wait_status;
+      }
+  }
+  lock_release(&wait_list_mutex);
+
+  if (child_status == NULL) {
+      return -1;
+  }
+
+  sema_down(&child_status->terminated);
+  int status_code = child_status->exit_code;
+  lock_acquire(&child_status->mutex);
+  child_status->ref_count--;
+  ASSERT (child_status->ref_count == 0);
+  lock_release(&child_status->mutex); // Not strictly necessary
+
+  lock_acquire(&wait_list_mutex);
+  list_remove(&child_status->elem);
+  lock_release(&wait_list_mutex);
+  free(child_status);
+
+  return status_code;
 }
 
 /* Free the current process's resources. */
 void
-process_exit (void)
+process_exit (int status)
 {
   struct thread *cur = thread_current ();
+
+  // No need for wait_status if parent has already exited
+  struct wait_status *wait_status = cur->wait_status;
+  wait_status->exit_code = status;
+  lock_acquire(&wait_status->mutex);
+  wait_status->ref_count--;
+  if (wait_status->ref_count > 0) {
+      sema_up(&wait_status->terminated);
+      lock_release(&wait_status->mutex);
+  }
+  else {
+      lock_acquire(&wait_list_mutex);
+      list_remove(&wait_status->elem);
+      lock_release(&wait_list_mutex);
+      free(wait_status);
+  }
+
+  // This process can no longer wait for any of its children
+  // Need to be careful since we're removing as we iterate here
+  lock_acquire(&wait_list_mutex);
+  struct list_elem *current = list_begin(&wait_list);
+  while (current != list_end(&wait_list)) {
+      wait_status = list_entry(current, struct wait_status, elem);
+      if (wait_status->parent == cur->tid) {
+          lock_acquire(&wait_status->mutex);
+          wait_status->ref_count--;
+          if (wait_status->ref_count == 0) {
+              current = list_remove(current);
+              free(wait_status);
+          } else {
+              lock_release(&wait_status->mutex);
+              current = list_next(current);
+          }
+      } else {
+          current = list_next(current);
+      }
+  }
+  lock_release(&wait_list_mutex);
+
+  if (cur->exec_file != NULL) {
+      file_allow_write(cur->exec_file);
+      file_close(cur->exec_file);
+  }
+
+  /*
+  for (int i = 0; i < MAX_FDS; i++) {
+      struct file *file = cur->open_files[i];
+      if (file != NULL && (uint32_t)file != RESERVED_FILE) {
+          file_close(file);
+      }
+  }
+  */
+
   uint32_t *pd;
 
   /* Destroy the current process's page directory and switch back
@@ -124,7 +236,6 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
-  sema_up (&temporary);
 }
 
 /* Sets up the CPU for running user code in the current
@@ -217,20 +328,13 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
    and its initial stack pointer into *ESP.
    Returns true if successful, false otherwise. */
 bool
-load (char *cmd_line, void (**eip) (void), void **esp)
+load (char *file_name, char *cmd_line, void (**eip) (void), void **esp)
 {
   struct thread *t = thread_current ();
   struct Elf32_Ehdr ehdr;
-  struct file *file = NULL;
   off_t file_ofs;
   bool success = false;
   int i;
-
-  // Extract first argument - our executable file
-  size_t len;
-  for (len = 0; cmd_line[len] != ' ' && cmd_line[len] != '\0'; len++);
-  char file_name[len + 1];
-  strlcpy(file_name, cmd_line, len + 1);
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
@@ -239,15 +343,16 @@ load (char *cmd_line, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
-  file = filesys_open (file_name);
-  if (file == NULL)
+  t->exec_file = filesys_open (file_name);
+  if (t->exec_file == NULL)
     {
       printf ("load: %s: open failed\n", file_name);
       goto done;
     }
+  file_deny_write(t->exec_file);
 
   /* Read and verify executable header. */
-  if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
+  if (file_read (t->exec_file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
       || ehdr.e_type != 2
       || ehdr.e_machine != 3
@@ -265,11 +370,11 @@ load (char *cmd_line, void (**eip) (void), void **esp)
     {
       struct Elf32_Phdr phdr;
 
-      if (file_ofs < 0 || file_ofs > file_length (file))
+      if (file_ofs < 0 || file_ofs > file_length (t->exec_file))
         goto done;
-      file_seek (file, file_ofs);
+      file_seek (t->exec_file, file_ofs);
 
-      if (file_read (file, &phdr, sizeof phdr) != sizeof phdr)
+      if (file_read (t->exec_file, &phdr, sizeof phdr) != sizeof phdr)
         goto done;
       file_ofs += sizeof phdr;
       switch (phdr.p_type)
@@ -286,7 +391,7 @@ load (char *cmd_line, void (**eip) (void), void **esp)
         case PT_SHLIB:
           goto done;
         case PT_LOAD:
-          if (validate_segment (&phdr, file))
+          if (validate_segment (&phdr, t->exec_file))
             {
               bool writable = (phdr.p_flags & PF_W) != 0;
               uint32_t file_page = phdr.p_offset & ~PGMASK;
@@ -308,7 +413,7 @@ load (char *cmd_line, void (**eip) (void), void **esp)
                   read_bytes = 0;
                   zero_bytes = ROUND_UP (page_offset + phdr.p_memsz, PGSIZE);
                 }
-              if (!load_segment (file, file_page, (void *) mem_page,
+              if (!load_segment (t->exec_file, file_page, (void *) mem_page,
                                  read_bytes, zero_bytes, writable))
                 goto done;
             }
@@ -329,7 +434,11 @@ load (char *cmd_line, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  if (!success && t->exec_file != NULL) {
+      file_allow_write(t->exec_file);
+      file_close(t->exec_file);
+      t->exec_file = NULL;
+  }
   return success;
 }
 
